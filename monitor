@@ -1,0 +1,595 @@
+import cv2
+import numpy as np
+import time
+import threading
+import base64
+import requests
+from ultralytics import YOLO
+
+CALLMEBOT_API_KEY = "2466342"
+PHONE_NUMBER = "+85253455568"
+IMGBB_API_KEY = "c3d0dc753324e8d044e124c996aa594f"
+
+CONFIG = {
+    "camera_id": 0,
+    "frame_width": 640,
+    "frame_height": 480,
+    "yolo_conf": 0.6,
+    "yolo_iou": 0.3,
+    "yolo_imgsz": 416,
+    "disappear_match_ratio": 0.3,
+    "disappear_confirm": 3,
+    "iou_threshold_for_duplicate": 0.5,
+    "recover_match_ratio": 0.3,
+    "recover_search_scale": 1.5,
+    "recover_timeout": 5.0,
+    "max_selected_objects": 5,
+    "min_manual_features": 20,
+}
+
+class State:
+    IDLE = 0
+    SELECTING = 1
+    MONITORING = 2
+
+state = State.IDLE
+selected_objects = []
+monitored_objects = []
+person_enabled = False
+send_alert_enabled = False
+frame_counter = 0
+yolo = None
+orb = cv2.ORB_create(nfeatures=500)
+mouse_data = {"click": None, "drag_start": None, "drag_end": None, "drag_current": None}
+manual_select_mode = False
+last_full_objects = []
+
+last_human_count = 0
+human_alert_exit_done = False
+
+def compute_iou(box1, box2):
+    x1, y1, w1, h1 = box1
+    x2, y2, w2, h2 = box2
+    inter_x1 = max(x1, x2)
+    inter_y1 = max(y1, y2)
+    inter_x2 = min(x1 + w1, x2 + w2)
+    inter_y2 = min(y1 + h1, y2 + h2)
+    if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+        return 0.0
+    inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+    box1_area = w1 * h1
+    box2_area = w2 * h2
+    union = box1_area + box2_area - inter_area
+    return inter_area / union if union > 0 else 0.0
+
+def find_selected_index(obj, selected_list):
+    for i, sel in enumerate(selected_list):
+        if compute_iou(obj["bbox"], sel["bbox"]) >= CONFIG["iou_threshold_for_duplicate"]:
+            return i
+    return -1
+
+def find_obj_at_point(px, py, obj_list):
+    candidates = []
+    for obj in obj_list:
+        x, y, w, h = obj["bbox"]
+        if x <= px <= x + w and y <= py <= y + h:
+            candidates.append((w * h, obj))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda x: x[0])[1]
+
+def remove_oldest_if_limit():
+    global selected_objects
+    if len(selected_objects) > CONFIG["max_selected_objects"]:
+        selected_objects.sort(key=lambda x: x.get("added_time", 0))
+        selected_objects.pop(0)
+
+def has_enough_features(frame, bbox):
+    x, y, w, h = bbox
+    x1 = max(0, x)
+    y1 = max(0, y)
+    x2 = min(frame.shape[1], x + w)
+    y2 = min(frame.shape[0], y + h)
+    if x2 <= x1 or y2 <= y1:
+        return False
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0:
+        return False
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    kp, _ = orb.detectAndCompute(gray, None)
+    return len(kp) >= CONFIG["min_manual_features"]
+
+class Notifier:
+    @staticmethod
+    def upload_image(img_bgr):
+        if not send_alert_enabled:
+            return None
+        _, encoded = cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        img_base64 = base64.b64encode(encoded).decode('utf-8')
+        payload = {"key": IMGBB_API_KEY, "image": img_base64, "expiration": 86400}
+        try:
+            resp = requests.post("https://api.imgbb.com/1/upload", data=payload, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()["data"]
+                return data.get("display_url") or data.get("url")
+        except:
+            return None
+        return None
+
+    @staticmethod
+    def send_text(message):
+        if not send_alert_enabled:
+            return False
+        params = {"phone": PHONE_NUMBER, "text": message, "apikey": CALLMEBOT_API_KEY}
+        try:
+            r = requests.get("https://api.callmebot.com/whatsapp.php", params=params, timeout=15)
+            return r.status_code == 200
+        except:
+            return False
+
+    @classmethod
+    def send_alert(cls, reason, img_bgr=None):
+        if not send_alert_enabled:
+            return
+        def _send():
+            img_url = cls.upload_image(img_bgr) if img_bgr is not None else None
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            if img_url:
+                msg = f"⚠️ {reason}\n時間：{ts}\n查看圖片：{img_url}"
+            else:
+                msg = f"⚠️ {reason}\n時間：{ts}"
+            cls.send_text(msg)
+        threading.Thread(target=_send, daemon=True).start()
+
+def init_yolo():
+    global yolo
+    yolo = YOLO("yolov8n.pt")
+    try:
+        yolo.to('mps')
+    except:
+        yolo.to('cpu')
+
+def detect_objects(frame):
+    results = yolo(frame, conf=CONFIG["yolo_conf"], iou=CONFIG["yolo_iou"],
+                   imgsz=CONFIG["yolo_imgsz"], verbose=False)
+    dets = []
+    if results[0].boxes is not None:
+        boxes = results[0].boxes.xyxy.cpu().numpy()
+        confs = results[0].boxes.conf.cpu().numpy()
+        cls_ids = results[0].boxes.cls.cpu().numpy().astype(int)
+        names = results[0].names
+        for box, conf, cls_id in zip(boxes, confs, cls_ids):
+            x1, y1, x2, y2 = box.astype(int)
+            w = x2 - x1
+            h = y2 - y1
+            dets.append({
+                "label": names[cls_id],
+                "bbox": (x1, y1, w, h),
+                "confidence": float(conf)
+            })
+    return dets
+
+def extract_roi_features(frame, bbox, expand_ratio=1.0):
+    x, y, w, h = bbox
+    if expand_ratio != 1.0:
+        new_w = int(w * expand_ratio)
+        new_h = int(h * expand_ratio)
+        new_x = max(0, x + (w - new_w) // 2)
+        new_y = max(0, y + (h - new_h) // 2)
+        x, y, w, h = new_x, new_y, new_w, new_h
+    x1 = max(0, x-5)
+    y1 = max(0, y-5)
+    x2 = min(frame.shape[1], x+w+5)
+    y2 = min(frame.shape[0], y+h+5)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0:
+        return None
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    _, des = orb.detectAndCompute(gray, None)
+    return des
+
+def match_ratio(des1, des2):
+    if des1 is None or des2 is None or len(des1) < 5 or len(des2) < 5:
+        return 0
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+    matches = bf.knnMatch(des1, des2, k=2)
+    good = 0
+    for m, n in matches:
+        if m.distance < 0.75 * n.distance:
+            good += 1
+    return good / len(des1)
+
+def manual_add_object(bbox):
+    global selected_objects
+    for sel in selected_objects:
+        if compute_iou(bbox, sel["bbox"]) >= CONFIG["iou_threshold_for_duplicate"]:
+            return False
+
+    manual_objs = [obj for obj in selected_objects if obj.get("confidence") == 1.0]
+    if len(manual_objs) < CONFIG["max_selected_objects"]:
+        used_numbers = set()
+        for obj in manual_objs:
+            label = obj["label"]
+            if label.startswith("Item"):
+                try:
+                    num = int(label[4:])
+                    used_numbers.add(num)
+                except:
+                    pass
+        for i in range(1, CONFIG["max_selected_objects"] + 1):
+            if i not in used_numbers:
+                new_num = i
+                break
+        else:
+            new_num = 1
+    else:
+        manual_objs.sort(key=lambda x: x.get("added_time", 0))
+        oldest = manual_objs[0]
+        old_label = oldest["label"]
+        new_num = int(old_label[4:])
+        selected_objects.remove(oldest)
+    label = f"Item{new_num}"
+    new_obj = {
+        "label": label,
+        "bbox": bbox,
+        "confidence": 1.0,
+        "added_time": time.time()
+    }
+    selected_objects.append(new_obj)
+    remove_oldest_if_limit()
+    return True
+
+def draw_button(img, text, x, y, w, h, active=False):
+    color = (0, 200, 0) if active else (70, 70, 70)
+    border_color = (0, 255, 0) if active else (150, 150, 150)
+    cv2.rectangle(img, (x, y), (x+w, y+h), color, -1)
+    cv2.rectangle(img, (x, y), (x+w, y+h), border_color, 1)
+    cv2.putText(img, text, (x+6, y+25+1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 2)
+    cv2.putText(img, text, (x+5, y+25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+    return (x, y, w, h)
+
+def draw_led(img, x, y, color, is_on):
+    if not is_on:
+        return
+    cv2.circle(img, (x, y), 8, color, -1)
+    cv2.circle(img, (x, y), 8, (200,200,200), 1)
+
+def draw_list_background(img, x, y, w, h):
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x, y), (x+w, y+h), (0,0,0), -1)
+    cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
+    cv2.rectangle(img, (x, y), (x+w, y+h), (200,200,200), 1)
+
+def mouse_callback(event, x, y, flags, param):
+    global manual_select_mode
+    if manual_select_mode:
+        if event == cv2.EVENT_LBUTTONDOWN:
+            mouse_data["drag_start"] = (x, y)
+            mouse_data["drag_end"] = None
+            mouse_data["drag_current"] = None
+            mouse_data["click"] = None
+        elif event == cv2.EVENT_LBUTTONUP:
+            if mouse_data["drag_start"] is not None:
+                start_x, start_y = mouse_data["drag_start"]
+                if abs(x - start_x) < 5 and abs(y - start_y) < 5:
+                    mouse_data["click"] = (x, y)
+                else:
+                    mouse_data["drag_end"] = (x, y)
+            mouse_data["drag_current"] = None
+        elif event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON):
+            mouse_data["drag_current"] = (x, y)
+    else:
+        if event == cv2.EVENT_LBUTTONDOWN:
+            mouse_data["click"] = (x, y)
+
+def main():
+    global state, selected_objects, monitored_objects, person_enabled, send_alert_enabled
+    global frame_counter, last_full_objects, last_human_count, human_alert_exit_done
+    global manual_select_mode, mouse_data
+
+    init_yolo()
+    cap = cv2.VideoCapture(CONFIG["camera_id"])
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CONFIG["frame_width"])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CONFIG["frame_height"])
+    cv2.namedWindow("Smart Monitor")
+    cv2.setMouseCallback("Smart Monitor", mouse_callback)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_counter += 1
+        display = frame.copy()
+
+        if manual_select_mode and mouse_data["drag_start"] is not None and mouse_data["drag_end"] is not None:
+            x1, y1 = mouse_data["drag_start"]
+            x2, y2 = mouse_data["drag_end"]
+            if abs(x2 - x1) > 10 and abs(y2 - y1) > 10:
+                bbox = (min(x1, x2), min(y1, y2), abs(x2-x1), abs(y2-y1))
+                if has_enough_features(frame, bbox):
+                    success = manual_add_object(bbox)
+                    if success:
+                        manual_select_mode = False
+            mouse_data["drag_start"] = None
+            mouse_data["drag_end"] = None
+            mouse_data["drag_current"] = None
+
+        if person_enabled or state == State.SELECTING or (state == State.MONITORING and frame_counter % 2 == 0):
+            full_objects = detect_objects(frame)
+            last_full_objects = full_objects
+        else:
+            full_objects = last_full_objects
+
+        person_boxes = [obj["bbox"] for obj in full_objects if obj["label"] == "person"]
+        has_person = len(person_boxes) > 0
+
+        if person_enabled:
+            if has_person:
+                if last_human_count == 0:
+                    Notifier.send_alert("偵測到人進入", frame)
+                human_alert_exit_done = False
+            else:
+                if last_human_count > 0 and not human_alert_exit_done:
+                    Notifier.send_alert("偵測到人離開", frame)
+                    human_alert_exit_done = True
+            last_human_count = len(person_boxes)
+
+        if state == State.SELECTING:
+            forbidden = ["person", "cat", "dog"]
+            selectable_objects = [obj for obj in full_objects if obj["label"] not in forbidden]
+        else:
+            selectable_objects = []
+
+        if state == State.MONITORING and monitored_objects:
+            now_time = time.time()
+            new_list = []
+            any_disappeared = False
+
+            for obj in monitored_objects:
+                if obj.get("status") == "MISSING":
+                    new_list.append(obj)
+                    continue
+
+                x, y, w, h = obj["bbox"]
+                x1 = max(0, x-10)
+                y1 = max(0, y-10)
+                x2 = min(frame.shape[1], x+w+10)
+                y2 = min(frame.shape[0], y+h+10)
+                roi = frame[y1:y2, x1:x2]
+                if roi.size == 0:
+                    cur_features = None
+                else:
+                    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                    _, cur_features = orb.detectAndCompute(gray, None)
+                if cur_features is None:
+                    obj["missing_cnt"] = obj.get("missing_cnt", 0) + 1
+                else:
+                    ratio = match_ratio(obj["features"], cur_features)
+                    if ratio < CONFIG["disappear_match_ratio"]:
+                        obj["missing_cnt"] = obj.get("missing_cnt", 0) + 1
+                    else:
+                        obj["missing_cnt"] = 0
+
+                if obj["missing_cnt"] >= CONFIG["disappear_confirm"]:
+                    obj["status"] = "MISSING"
+                    obj["missing_since"] = now_time
+                    _, img_encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    obj["snapshot"] = img_encoded.tobytes()
+                new_list.append(obj)
+
+            for obj in new_list[:]:
+                if obj.get("status") != "MISSING":
+                    continue
+                if now_time - obj["missing_since"] >= CONFIG["recover_timeout"]:
+                    snapshot_img = cv2.imdecode(np.frombuffer(obj["snapshot"], np.uint8), cv2.IMREAD_COLOR)
+                    Notifier.send_alert(f"{obj['label']} 已被取走", snapshot_img)
+                    any_disappeared = True
+                    new_list.remove(obj)
+                    continue
+
+                expanded = extract_roi_features(frame, obj["bbox"], expand_ratio=CONFIG["recover_search_scale"])
+                if expanded is not None and match_ratio(obj["features"], expanded) >= CONFIG["recover_match_ratio"]:
+                    obj["status"] = "NORMAL"
+                    obj["missing_cnt"] = 0
+                    obj.pop("missing_since", None)
+                    obj.pop("snapshot", None)
+                    obj["features"] = expanded
+            monitored_objects = new_list
+
+        if state == State.MONITORING:
+            if len(monitored_objects) == 0:
+                state = State.IDLE
+                selected_objects = []
+                manual_select_mode = False
+
+        if person_enabled:
+            for obj in full_objects:
+                if obj["label"] == "person":
+                    x, y, w, h = obj["bbox"]
+                    cv2.rectangle(display, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                    cv2.putText(display, "Person", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,0), 1)
+
+        if state == State.SELECTING:
+            for obj in selectable_objects:
+                x, y, w, h = obj["bbox"]
+                is_selected = find_selected_index(obj, selected_objects) != -1
+                color = (0, 255, 0) if is_selected else (0, 0, 255)
+                cv2.rectangle(display, (x, y), (x+w, y+h), color, 2)
+                cv2.putText(display, obj["label"], (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            for obj in selected_objects:
+                if obj.get("confidence") == 1.0:
+                    x, y, w, h = obj["bbox"]
+                    cv2.rectangle(display, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                    cv2.putText(display, obj["label"], (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+
+        for obj in monitored_objects:
+            x, y, w, h = obj["bbox"]
+            if obj.get("status") == "MISSING":
+                color = (0, 0, 255)
+                label_status = "Missing?"
+            else:
+                color = (0, 255, 0)
+                label_status = "Monitor"
+            cv2.rectangle(display, (x, y), (x+w, y+h), color, 2)
+            cv2.putText(display, f"{label_status}: {obj['label']}", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+        if manual_select_mode and mouse_data.get("drag_start") and mouse_data.get("drag_current"):
+            x1, y1 = mouse_data["drag_start"]
+            x2, y2 = mouse_data["drag_current"]
+            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 255), 2)
+
+        led_start_x = display.shape[1] - 120
+        led_y = 30
+        spacing = 30
+
+        blue_box_exists = person_enabled and has_person
+        draw_led(display, led_start_x, led_y, (255, 0, 0), blue_box_exists)
+
+        green_box_exists = any(obj.get("status") != "MISSING" for obj in monitored_objects)
+        draw_led(display, led_start_x + spacing, led_y, (0, 255, 0), green_box_exists)
+
+        red_box_exists = any(obj.get("status") == "MISSING" for obj in monitored_objects)
+        draw_led(display, led_start_x + spacing * 2, led_y, (0, 0, 255), red_box_exists)
+
+        btn_w, btn_h = 130, 35
+        start_x = 10
+        start_y = 50
+        btn_person = draw_button(display, "Person Monitor", start_x, start_y, btn_w, btn_h, person_enabled)
+        btn_item = draw_button(display, "Item Monitor", start_x, start_y+45, btn_w, btn_h, state == State.MONITORING)
+        msg_text = "Msg: ON" if send_alert_enabled else "Msg: OFF"
+        btn_alert = draw_button(display, msg_text, start_x, start_y+90, btn_w, btn_h, send_alert_enabled)
+
+        if state == State.SELECTING or state == State.MONITORING:
+            list_x = display.shape[1] - 160
+            list_w = 150
+            list_h = 180
+            draw_list_background(display, list_x-5, 45, list_w+10, list_h+10)
+            if state == State.SELECTING:
+                cv2.putText(display, "Selected:", (list_x, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
+                for i, obj in enumerate(selected_objects):
+                    cv2.putText(display, f"- {obj['label']}", (list_x, 95 + i*20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,255), 1)
+            else:
+                cv2.putText(display, "Monitoring:", (list_x, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+                for i, obj in enumerate(monitored_objects):
+                    mark = "?" if obj.get("status") == "MISSING" else ""
+                    cv2.putText(display, f"- {obj['label']}{mark}", (list_x, 95 + i*20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,0), 1)
+
+        right_btn_x = display.shape[1] - 150
+        btn_y_exit = display.shape[0] - 50 - 35
+        if state == State.SELECTING:
+            if len(selected_objects) == 0:
+                btn_back = draw_button(display, "Back", right_btn_x, btn_y_exit, 140, 35)
+                btn_manual = draw_button(display, "Add Item", right_btn_x, btn_y_exit - 45, 140, 35, manual_select_mode)
+                btn_clear = btn_confirm = None
+            else:
+                btn_confirm = draw_button(display, "Confirm", right_btn_x, btn_y_exit, 140, 35)
+                btn_clear = draw_button(display, "Clear All", right_btn_x, btn_y_exit - 45, 140, 35)
+                btn_manual = draw_button(display, "Add Item", right_btn_x, btn_y_exit - 90, 140, 35, manual_select_mode)
+                btn_back = None
+        else:
+            btn_manual = btn_clear = btn_confirm = btn_back = None
+
+        if state != State.SELECTING:
+            btn_exit = draw_button(display, "Exit", 10, display.shape[0] - 50, 80, 35)
+        else:
+            btn_exit = None
+
+        if state == State.SELECTING:
+            display_state = "SELECTING"
+        elif person_enabled or (state == State.MONITORING):
+            display_state = "MONITORING"
+        else:
+            display_state = "IDLE"
+        cv2.putText(display, f"State: {display_state}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+        if mouse_data["click"]:
+            mx, my = mouse_data["click"]
+            mouse_data["click"] = None
+            clicked = False
+
+            if btn_person and (btn_person[0] <= mx <= btn_person[0]+btn_person[2] and btn_person[1] <= my <= btn_person[1]+btn_person[3]):
+                person_enabled = not person_enabled
+                if not person_enabled:
+                    last_human_count = 0
+                    human_alert_exit_done = False
+                clicked = True
+            elif btn_item and (btn_item[0] <= mx <= btn_item[0]+btn_item[2] and btn_item[1] <= my <= btn_item[1]+btn_item[3]):
+                if state == State.MONITORING:
+                    state = State.IDLE
+                    monitored_objects = []
+                    selected_objects = []
+                    manual_select_mode = False
+                else:
+                    if state != State.SELECTING:
+                        state = State.SELECTING
+                        selected_objects = []
+                clicked = True
+            elif btn_alert and (btn_alert[0] <= mx <= btn_alert[0]+btn_alert[2] and btn_alert[1] <= my <= btn_alert[1]+btn_alert[3]):
+                send_alert_enabled = not send_alert_enabled
+                clicked = True
+            elif btn_confirm and (btn_confirm[0] <= mx <= btn_confirm[0]+btn_confirm[2] and btn_confirm[1] <= my <= btn_confirm[1]+btn_confirm[3]):
+                if state == State.SELECTING and selected_objects:
+                    monitored_objects = []
+                    for sel in selected_objects:
+                        feats = extract_roi_features(frame, sel["bbox"])
+                        if feats is not None:
+                            monitored_objects.append({
+                                "label": sel["label"],
+                                "bbox": sel["bbox"],
+                                "features": feats,
+                                "missing_cnt": 0,
+                                "status": "NORMAL",
+                            })
+                    selected_objects = []
+                    state = State.MONITORING
+                    manual_select_mode = False
+                clicked = True
+            elif btn_clear and (btn_clear[0] <= mx <= btn_clear[0]+btn_clear[2] and btn_clear[1] <= my <= btn_clear[1]+btn_clear[3]):
+                selected_objects = []
+                clicked = True
+            elif btn_manual and (btn_manual[0] <= mx <= btn_manual[0]+btn_manual[2] and btn_manual[1] <= my <= btn_manual[1]+btn_manual[3]):
+                manual_select_mode = not manual_select_mode
+                if manual_select_mode:
+                    mouse_data["drag_start"] = None
+                    mouse_data["drag_end"] = None
+                    mouse_data["drag_current"] = None
+                clicked = True
+            elif btn_back and (btn_back[0] <= mx <= btn_back[0]+btn_back[2] and btn_back[1] <= my <= btn_back[1]+btn_back[3]):
+                state = State.IDLE
+                selected_objects = []
+                monitored_objects = []
+                manual_select_mode = False
+                clicked = True
+            elif btn_exit and (btn_exit[0] <= mx <= btn_exit[0]+btn_exit[2] and btn_exit[1] <= my <= btn_exit[1]+btn_exit[3]):
+                cap.release()
+                cv2.destroyAllWindows()
+                return
+
+            if not clicked and state == State.SELECTING and not manual_select_mode:
+                obj = find_obj_at_point(mx, my, selectable_objects)
+                if obj:
+                    if "added_time" not in obj:
+                        obj["added_time"] = time.time()
+                    idx = find_selected_index(obj, selected_objects)
+                    if idx == -1:
+                        selected_objects.append(obj)
+                        remove_oldest_if_limit()
+                    else:
+                        selected_objects.pop(idx)
+                else:
+                    manual_objs = [o for o in selected_objects if o.get("confidence") == 1.0]
+                    obj = find_obj_at_point(mx, my, manual_objs)
+                    if obj:
+                        selected_objects.remove(obj)
+
+        cv2.imshow("Smart Monitor", display)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
